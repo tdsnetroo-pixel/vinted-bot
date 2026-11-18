@@ -1,0 +1,245 @@
+name: vinted-bot
+
+on:
+  schedule:
+    - cron: "*/10 * * * *"   # corre de ~10 em ~10 minutos
+  workflow_dispatch:          # permite arrancar à mão
+
+permissions:
+  contents: read
+
+concurrency:
+  group: vinted-bot
+  cancel-in-progress: false
+
+jobs:
+  bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 9
+    steps:
+      - uses: actions/cache/restore@v4
+        with:
+          path: data
+          key: estado-${{ github.run_id }}
+          restore-keys: estado-
+
+      - run: pip install -q requests
+
+      - name: Bot
+        env:
+          TELEGRAM_TOKEN: ${{ secrets.TELEGRAM_TOKEN }}
+        run: |
+          python3 - <<'PY'
+          import json, os, random, time
+          from pathlib import Path
+          import requests
+
+          TOKEN = os.environ.get("TELEGRAM_TOKEN")
+          if not TOKEN:
+              raise SystemExit("Falta o secret TELEGRAM_TOKEN")
+          TG = f"https://api.telegram.org/bot{TOKEN}"
+          DOMINIO = "https://www.vinted.pt"
+          D = Path("data"); D.mkdir(exist_ok=True)
+          FC, FV = D / "config.json", D / "vistos.json"
+          OUVIR_SEGUNDOS = 240   # tempo a responder a comandos por execução
+
+          INICIAL = {
+              "dono": None, "pausado": False, "min_preco": 3, "tamanhos": [],
+              "offset": None, "registadas": [], "erro_avisado": False,
+              "marcas": {
+                  "Supreme": 40, "Stüssy": 30, "Palace": 40, "Corteiz": 50,
+                  "Carhartt WIP": 25, "Bape": 50, "Off-White": 60,
+                  "Stone Island": 60, "Arc'teryx": 60, "The North Face": 30,
+                  "Trapstar": 35, "Represent": 40,
+              },
+          }
+          PROIBIDAS = ["fake", "réplica", "replica", "inspired", "style", "tipo",
+                       "similar", "não original", "nao original", "rep ", "1:1",
+                       "procuro", "troco"]
+          HEADERS = {
+              "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                             "AppleWebKit/537.36 (KHTML, like Gecko) "
+                             "Chrome/130.0 Safari/537.36"),
+              "Accept": "application/json, text/plain, */*",
+              "Accept-Language": "pt-PT,pt;q=0.9,en;q=0.8",
+          }
+
+          cfg = {**INICIAL, **(json.loads(FC.read_text(encoding="utf-8"))
+                               if FC.exists() else {})}
+          vistos = dict.fromkeys(json.loads(FV.read_text()) if FV.exists() else [])
+
+          def guardar():
+              FC.write_text(json.dumps(cfg, ensure_ascii=False, indent=2),
+                            encoding="utf-8")
+              FV.write_text(json.dumps(list(vistos)[-5000:]))
+
+          # ------------------------- Telegram -------------------------
+          def enviar(chat, texto, foto=None):
+              try:
+                  if foto:
+                      requests.post(f"{TG}/sendPhoto", timeout=20, data={
+                          "chat_id": chat, "photo": foto, "caption": texto[:1024]})
+                  else:
+                      requests.post(f"{TG}/sendMessage", timeout=20, data={
+                          "chat_id": chat, "text": texto,
+                          "disable_web_page_preview": True})
+              except requests.RequestException as e:
+                  print("Erro Telegram:", e)
+
+          AJUDA = ("👋 Bot Vinted Streetwear\n\n"
+                   "/marcas – ver marcas e preços máximos\n"
+                   "/add <marca> <preço> – ex.: /add Carhartt WIP 25\n"
+                   "/rem <marca> – remover marca\n"
+                   "/tamanhos M L – filtrar tamanhos (só /tamanhos = todos)\n"
+                   "/pausa · /retomar\n"
+                   "/estado – ver configuração\n\n"
+                   "ℹ️ O bot acorda de ~10 em ~10 min, por isso as respostas "
+                   "podem demorar alguns minutos.")
+
+          def comando(chat, texto):
+              p = texto.strip().split()
+              cmd, args = p[0].split("@")[0].lower(), p[1:]
+              if cfg["dono"] is None and cmd == "/start":
+                  cfg["dono"] = chat
+              if chat != cfg["dono"]:
+                  return enviar(chat, "⛔ Este bot é privado.")
+              if cmd in ("/start", "/ajuda", "/help"):
+                  enviar(chat, AJUDA)
+              elif cmd == "/marcas":
+                  enviar(chat, "\n".join(f"• {m}: até {v:g} €" for m, v in sorted(
+                      cfg["marcas"].items(), key=lambda x: x[0].lower()))
+                      or "Sem marcas. Usa /add.")
+              elif cmd == "/add":
+                  try:
+                      preco = float(args[-1].replace(",", ".").replace("€", ""))
+                      marca = " ".join(args[:-1])
+                      assert marca
+                  except (IndexError, ValueError, AssertionError):
+                      return enviar(chat, "Uso: /add <marca> <preço>")
+                  cfg["marcas"][marca] = preco
+                  enviar(chat, f"✅ {marca} até {preco:g} €")
+              elif cmd == "/rem":
+                  alvo = " ".join(args).lower()
+                  for m in list(cfg["marcas"]):
+                      if m.lower() == alvo:
+                          del cfg["marcas"][m]
+                          if m in cfg["registadas"]:
+                              cfg["registadas"].remove(m)
+                          return enviar(chat, f"🗑 {m} removida")
+                  enviar(chat, "Marca não encontrada. Vê /marcas.")
+              elif cmd == "/tamanhos":
+                  cfg["tamanhos"] = [a.upper() for a in args]
+                  enviar(chat, "Tamanhos: " + (", ".join(cfg["tamanhos"]) or "todos"))
+              elif cmd == "/pausa":
+                  cfg["pausado"] = True; enviar(chat, "⏸ Pausado")
+              elif cmd == "/retomar":
+                  cfg["pausado"] = False; enviar(chat, "▶️ A procurar outra vez")
+              elif cmd == "/estado":
+                  enviar(chat, f"Estado: {'⏸ pausado' if cfg['pausado'] else '▶️ ativo'}\n"
+                               f"Marcas: {len(cfg['marcas'])}\n"
+                               f"Tamanhos: {', '.join(cfg['tamanhos']) or 'todos'}")
+              else:
+                  enviar(chat, "Comando desconhecido. /ajuda")
+
+          def ler_comandos(espera):
+              try:
+                  r = requests.get(f"{TG}/getUpdates", timeout=espera + 15,
+                                   params={"timeout": espera, "offset": cfg["offset"]})
+                  for u in r.json().get("result", []):
+                      cfg["offset"] = u["update_id"] + 1
+                      m = u.get("message") or {}
+                      if m.get("text", "").startswith("/"):
+                          comando(m["chat"]["id"], m["text"])
+              except Exception as e:
+                  print("Erro no polling:", e)
+                  time.sleep(3)
+
+          # -------------------------- Vinted --------------------------
+          def preco_de(item):
+              p = item.get("price")
+              if isinstance(p, dict):
+                  p = p.get("amount")
+              try:
+                  return float(p)
+              except (TypeError, ValueError):
+                  return None
+
+          def norm(t):
+              return (t or "").lower().replace("ü", "u").replace("’", "'").strip()
+
+          def bom(item, marca, pmax):
+              preco = preco_de(item)
+              if preco is None or preco < cfg["min_preco"] or preco > pmax:
+                  return False
+              if norm(marca) not in norm(item.get("brand_title")):
+                  return False
+              if any(w in norm(item.get("title")) for w in PROIBIDAS):
+                  return False
+              t = cfg["tamanhos"]
+              return not t or (item.get("size_title") or "").upper() in t
+
+          def avisar_erro(msg):
+              print(msg)
+              if cfg["dono"] and not cfg["erro_avisado"]:
+                  enviar(cfg["dono"], "⚠️ " + msg)
+                  cfg["erro_avisado"] = True
+
+          def procurar():
+              s = requests.Session(); s.headers.update(HEADERS)
+              try:
+                  s.get(DOMINIO, timeout=20).raise_for_status()
+              except requests.RequestException as e:
+                  return avisar_erro(f"Não consegui abrir a Vinted ({e}). "
+                                     "Pode estar a bloquear o servidor do GitHub.")
+              ok = 0
+              for marca, pmax in list(cfg["marcas"].items()):
+                  try:
+                      r = s.get(f"{DOMINIO}/api/v2/catalog/items", timeout=20, params={
+                          "search_text": marca, "price_to": pmax,
+                          "order": "newest_first", "per_page": 30, "page": 1})
+                      r.raise_for_status()
+                      itens = r.json().get("items", [])
+                  except Exception as e:
+                      print(f"Erro em {marca}:", e)
+                      continue
+                  ok += 1
+                  primeira = marca not in cfg["registadas"]
+                  for it in itens:
+                      iid = it.get("id")
+                      if iid in vistos:
+                          continue
+                      vistos[iid] = None
+                      if not primeira and bom(it, marca, pmax):
+                          url = it.get("url") or f"{DOMINIO}/items/{iid}"
+                          enviar(cfg["dono"],
+                                 f"🔥 {marca} – {preco_de(it):.2f} € (limite {pmax:g} €)\n"
+                                 f"{it.get('title')}\n"
+                                 f"Tamanho: {it.get('size_title') or '?'} · "
+                                 f"{it.get('status') or ''}\n{url}",
+                                 foto=(it.get("photo") or {}).get("url"))
+                  if primeira:
+                      cfg["registadas"].append(marca)
+                  time.sleep(random.uniform(2, 4))
+              if cfg["marcas"] and ok == 0:
+                  avisar_erro("A Vinted recusou todas as pesquisas. Pode estar "
+                              "a bloquear o servidor do GitHub.")
+              elif ok:
+                  cfg["erro_avisado"] = False
+
+          # --------------------------- Ciclo ---------------------------
+          inicio = time.time()
+          ler_comandos(0)
+          if cfg["dono"] and not cfg["pausado"]:
+              procurar()
+          guardar()
+          while time.time() - inicio < OUVIR_SEGUNDOS:
+              ler_comandos(20)
+              guardar()
+          PY
+
+      - name: Guardar estado
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: data
+          key: estado-${{ github.run_id }}
